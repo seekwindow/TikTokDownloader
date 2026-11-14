@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Union
 
 from aiofiles import open
-from curl_cffi import CurlECode
+from curl_cffi import CurlECode, CurlHttpVersion
 from curl_cffi.requests import AsyncSession, Response
 from curl_cffi.requests.exceptions import HTTPError, RequestException
 from rich.progress import (
@@ -66,11 +66,12 @@ class Downloader:
     RANGE_BLOCK_SIZE = 2 * 1024 * 1024
     RANGE_TIMEOUT = 60
     RANGE_ATTEMPTS = 3
+    HTTP2_ERRORS = {CurlECode.HTTP2, CurlECode.HTTP2_STREAM}
     TRANSFER_ERRORS = {
         CurlECode.PARTIAL_FILE,
         CurlECode.OPERATION_TIMEDOUT,
         CurlECode.RECV_ERROR,
-    }
+    } | HTTP2_ERRORS
 
     def __init__(
         self,
@@ -646,6 +647,13 @@ class Downloader:
                 self.log.warning(
                     _("{show} 常规下载重试失败，尝试分块恢复下载").format(show=show)
                 )
+                force_http1 = failures[-1].code in self.HTTP2_ERRORS
+                if force_http1:
+                    self.log.warning(
+                        _("{show} HTTP/2 传输异常，使用 HTTP/1.1 分块恢复").format(
+                            show=show
+                        )
+                    )
                 response = failures[-1].response
                 result = await self._download_ranges(
                     url,
@@ -659,6 +667,7 @@ class Downloader:
                     self.__adapter_headers(headers, tiktok),
                     tiktok,
                     response if isinstance(response, Response) else None,
+                    force_http1=force_http1,
                 )
         if not result and finished:
             self.finished = True
@@ -758,14 +767,21 @@ class Downloader:
                     case _:
                         raise DownloaderError
             except HTTPError as e:
-                self.log.warning(
-                    _("响应码异常: {error_repr}").format(error_repr=repr(e))
-                )
-                self.console.warning(
-                    _(
-                        "如果 TikTok 平台作品下载功能异常，请检查配置文件中 browser_info_tiktok 的 device_id 参数！"
-                    ),
-                )
+                if e.code in self.TRANSFER_ERRORS:
+                    if failures is not None:
+                        failures.append(e)
+                    self.log.warning(
+                        _("网络异常: {error_repr}").format(error_repr=repr(e))
+                    )
+                else:
+                    self.log.warning(
+                        _("响应码异常: {error_repr}").format(error_repr=repr(e))
+                    )
+                    self.console.warning(
+                        _(
+                            "如果 TikTok 平台作品下载功能异常，请检查配置文件中 browser_info_tiktok 的 device_id 参数！"
+                        ),
+                    )
                 return False
             except RequestException as e:
                 if failures is not None:
@@ -946,6 +962,7 @@ class Downloader:
         headers: dict,
         tiktok: bool,
         original_response: Response | None,
+        force_http1: bool = False,
     ) -> bool:
         task_id = None
         position = self.__update_headers_range(headers, temp)
@@ -970,6 +987,7 @@ class Downloader:
                 proxy=self.proxy_tiktok if tiktok else self.proxy,
                 impersonate=self.impersonate_tiktok if tiktok else self.impersonate,
                 verify=True,
+                http_version=CurlHttpVersion.V1_1 if force_http1 else None,
             ) as client:
                 response, body, total = await self._read_range(
                     client, url, headers, show, position, None, validator
