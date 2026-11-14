@@ -1,13 +1,18 @@
 from asyncio import Semaphore, gather
+from base64 import b64encode
+from collections.abc import Mapping
 from datetime import datetime
+from hashlib import md5
 from pathlib import Path
+from re import fullmatch
 from shutil import move
 from time import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Union
 
 from aiofiles import open
-from curl_cffi.requests import Response
+from curl_cffi import CurlECode
+from curl_cffi.requests import AsyncSession, Response
 from curl_cffi.requests.exceptions import HTTPError, RequestException
 from rich.progress import (
     BarColumn,
@@ -23,6 +28,7 @@ from rich.progress import (
 from ..custom import (
     MAX_WORKERS,
     PROGRESS,
+    wait,
 )
 from ..tools import (
     CacheError,
@@ -35,8 +41,6 @@ from ..tools import (
 from ..translation import _
 
 if TYPE_CHECKING:
-    from curl_cffi.requests import AsyncSession
-
     from ..config import Parameter
     from ..manager import DownloadRecorder
     from ..module import FFMPEG
@@ -59,6 +63,14 @@ class Downloader:
         "application/octet-stream": "mp4",
     }
     WRITE_BUFFER_SIZE = 1024 * 1024 * 100
+    RANGE_BLOCK_SIZE = 2 * 1024 * 1024
+    RANGE_TIMEOUT = 60
+    RANGE_ATTEMPTS = 3
+    TRANSFER_ERRORS = {
+        CurlECode.PARTIAL_FILE,
+        CurlECode.OPERATION_TIMEDOUT,
+        CurlECode.RECV_ERROR,
+    }
 
     def __init__(
         self,
@@ -68,6 +80,8 @@ class Downloader:
         self.cleaner = params.CLEANER
         self.client: "AsyncSession" = params.client
         self.client_tiktok: "AsyncSession" = params.client_tiktok
+        self.impersonate = params.impersonate
+        self.impersonate_tiktok = params.impersonate_tiktok
         self.headers: dict = params.headers_download
         self.headers_tiktok: dict = params.headers_download_tiktok
         self.user_agent: str = params.user_agent
@@ -595,7 +609,6 @@ class Downloader:
         """未传入 switch 参数则判断音乐下载开关设置"""
         return all((switch or self.music, url, not self.is_exists(path)))
 
-    @Retry.retry
     async def request_file(
         self,
         url: str,
@@ -605,12 +618,71 @@ class Downloader:
         id_: str,
         suffix: str,
         count: SimpleNamespace,
-        progress: Progress,
-        headers: dict = None,
+        progress: Progress | FakeProgress,
+        headers: dict | None = None,
         tiktok=False,
         unknown_size=False,
-        semaphore: Semaphore = None,
+        semaphore: Semaphore | None = None,
+        finished=False,
     ) -> bool | None:
+        failures: list[RequestException] = []
+        result = await self._request_file(
+            url,
+            temp,
+            actual,
+            show,
+            id_,
+            suffix,
+            count,
+            progress,
+            headers=headers,
+            tiktok=tiktok,
+            unknown_size=unknown_size,
+            semaphore=semaphore,
+            failures=failures,
+        )
+        if not result and failures and failures[-1].code in self.TRANSFER_ERRORS:
+            async with semaphore or self.semaphore:
+                self.log.warning(
+                    _("{show} 常规下载重试失败，尝试分块恢复下载").format(show=show)
+                )
+                response = failures[-1].response
+                result = await self._download_ranges(
+                    url,
+                    temp,
+                    actual,
+                    show,
+                    id_,
+                    suffix,
+                    count,
+                    progress,
+                    self.__adapter_headers(headers, tiktok),
+                    tiktok,
+                    response if isinstance(response, Response) else None,
+                )
+        if not result and finished:
+            self.finished = True
+        return result
+
+    @Retry.retry
+    async def _request_file(
+        self,
+        url: str,
+        temp: Path,
+        actual: Path,
+        show: str,
+        id_: str,
+        suffix: str,
+        count: SimpleNamespace,
+        progress: Progress | FakeProgress,
+        headers: dict | None = None,
+        tiktok=False,
+        unknown_size=False,
+        semaphore: Semaphore | None = None,
+        failures: list[RequestException] | None = None,
+    ) -> bool | None:
+        if failures is not None:
+            failures.clear()
         async with semaphore or self.semaphore:
             client = self.client_tiktok if tiktok else self.client
             headers = self.__adapter_headers(
@@ -677,6 +749,7 @@ class Downloader:
                             position,
                             count,
                             progress,
+                            failures=failures,
                         )
                     case 0:
                         return True
@@ -695,6 +768,8 @@ class Downloader:
                 )
                 return False
             except RequestException as e:
+                if failures is not None:
+                    failures.append(e)
                 self.log.warning(_("网络异常: {error_repr}").format(error_repr=repr(e)))
                 return False
             except CacheError as e:
@@ -721,7 +796,8 @@ class Downloader:
         content: int,
         position: int,
         count: SimpleNamespace,
-        progress: Progress,
+        progress: Progress | FakeProgress,
+        failures: list[RequestException] | None = None,
     ) -> bool:
         task_id = progress.add_task(
             beautify_string(show, self.truncate),
@@ -746,6 +822,8 @@ class Downloader:
                     await f.write(bytes(buffer))
                 progress.remove_task(task_id)
         except RequestException as e:
+            if failures is not None:
+                failures.append(e)
             progress.remove_task(task_id)
             self.log.warning(
                 _("{show} 下载中断，错误信息：{error}").format(show=show, error=e)
@@ -759,12 +837,198 @@ class Downloader:
             if check == -1:
                 await self.recorder.delete_id(id_)
             return check == 0
+        return await self._finish_download(cache, actual, show, id_, count)
+
+    async def _finish_download(
+        self,
+        cache: Path,
+        actual: Path,
+        show: str,
+        id_: str,
+        count: SimpleNamespace,
+    ) -> bool:
         self.save_file(cache, actual)
         self.log.info(_("{show} 文件下载成功").format(show=show))
         self.log.info(f"文件路径 {actual.resolve()}", False)
         await self.recorder.update_id(id_)
         self.add_count(show, id_, count)
         return True
+
+    @staticmethod
+    def _range_validator(headers: Mapping[str, str]) -> tuple[str, str] | None:
+        if (etag := headers.get("ETag")) and not etag.startswith("W/"):
+            return "ETag", etag
+        if modified := headers.get("Last-Modified"):
+            return "Last-Modified", modified
+        return None
+
+    async def _read_range(
+        self,
+        client: AsyncSession,
+        url: str,
+        headers: dict,
+        show: str,
+        start: int,
+        total: int | None,
+        validator: tuple[str, str] | None,
+    ) -> tuple[Response, bytes, int]:
+        end = start + self.RANGE_BLOCK_SIZE - 1
+        if total is not None:
+            end = min(end, total - 1)
+        headers = headers.copy()
+        headers["Range"] = f"bytes={start}-{end}"
+        if validator:
+            headers["If-Range"] = validator[1]
+        for attempt in range(self.RANGE_ATTEMPTS):
+            try:
+                self.__record_request_messages(show, url, headers)
+                response = await client.get(url, headers=headers, stream=True)
+                response.raise_for_status()
+                match = fullmatch(
+                    r"bytes (\d+)-(\d+)/(\d+)",
+                    response.headers.get("Content-Range", ""),
+                )
+                if response.status_code != 206 or match is None:
+                    raise CacheError(_("服务器未返回有效的分块响应，停止恢复下载"))
+                actual_start, actual_end, actual_total = map(int, match.groups())
+                if (
+                    actual_total <= start
+                    or actual_start != start
+                    or actual_end != min(end, actual_total - 1)
+                    or (total is not None and actual_total != total)
+                ):
+                    raise CacheError(_("分块响应范围或文件大小不一致，停止恢复下载"))
+                if validator and response.headers.get(validator[0]) != validator[1]:
+                    raise CacheError(_("分块下载期间文件校验标识发生变化"))
+                body = bytearray()
+                expected = actual_end - actual_start + 1
+                async for chunk in response.aiter_content():
+                    if len(body) + len(chunk) > expected:
+                        raise CacheError(_("分块响应内容超出请求范围"))
+                    body.extend(chunk)
+                if len(body) != expected:
+                    raise RequestException(
+                        _("分块响应内容不完整"),
+                        CurlECode.PARTIAL_FILE,
+                        response,
+                    )
+                return response, bytes(body), actual_total
+            except RequestException as e:
+                if (
+                    e.code not in self.TRANSFER_ERRORS
+                    or attempt + 1 == self.RANGE_ATTEMPTS
+                ):
+                    raise
+                self.log.warning(
+                    _(
+                        "{show} 分块 {start}-{end} 下载中断，正在进行第 {index} 次重试：{error}"
+                    ).format(
+                        show=show,
+                        start=start,
+                        end=end,
+                        index=attempt + 1,
+                        error=e,
+                    )
+                )
+                await wait()
+        raise DownloaderError
+
+    async def _download_ranges(
+        self,
+        url: str,
+        temp: Path,
+        actual: Path,
+        show: str,
+        id_: str,
+        suffix: str,
+        count: SimpleNamespace,
+        progress: Progress | FakeProgress,
+        headers: dict,
+        tiktok: bool,
+        original_response: Response | None,
+    ) -> bool:
+        task_id = None
+        position = self.__update_headers_range(headers, temp)
+        validator = (
+            self._range_validator(original_response.headers)
+            if original_response is not None
+            else None
+        )
+        checksum = (
+            original_response.headers.get("Content-MD5")
+            if original_response is not None and original_response.status_code == 200
+            else None
+        )
+        digest = md5(usedforsecurity=False) if checksum else None
+        try:
+            if digest is not None and position:
+                async with open(temp, "rb") as file:
+                    while chunk := await file.read(self.RANGE_BLOCK_SIZE):
+                        digest.update(chunk)
+            async with AsyncSession(
+                timeout=max(self.timeout, self.RANGE_TIMEOUT),
+                proxy=self.proxy_tiktok if tiktok else self.proxy,
+                impersonate=self.impersonate_tiktok if tiktok else self.impersonate,
+                verify=True,
+            ) as client:
+                response, body, total = await self._read_range(
+                    client, url, headers, show, position, None, validator
+                )
+                check = self._download_initial_check(total, False, show)
+                if check != 1:
+                    return check == 0
+                validator = validator or self._range_validator(response.headers)
+                if validator is None:
+                    raise CacheError(_("服务器未提供校验标识，无法安全恢复分块下载"))
+                suffix = self._extract_content(response.headers, suffix)[1]
+                self._record_response(response, show, total)
+                task_id = progress.add_task(
+                    beautify_string(show, self.truncate),
+                    total=total,
+                    completed=position,
+                )
+                async with open(temp, "ab") as file:
+                    while True:
+                        await file.write(body)
+                        await file.flush()
+                        if digest is not None:
+                            digest.update(body)
+                        position += len(body)
+                        progress.update(task_id, advance=len(body))
+                        self.log.info(
+                            _("{show} 分块恢复进度：{position}/{total} 字节").format(
+                                show=show, position=position, total=total
+                            ),
+                            False,
+                        )
+                        if position == total:
+                            break
+                        response, body, total = await self._read_range(
+                            client, url, headers, show, position, total, validator
+                        )
+                if temp.stat().st_size != total:
+                    raise CacheError(_("分块恢复文件大小校验失败"))
+                if (
+                    digest is not None
+                    and b64encode(digest.digest()).decode("ascii") != checksum
+                ):
+                    raise CacheError(_("分块恢复文件 MD5 校验失败"))
+            return await self._finish_download(
+                temp, actual.with_suffix(f".{suffix}"), show, id_, count
+            )
+        except CacheError as e:
+            self.delete(temp)
+            await self.recorder.delete_id(id_)
+            self.log.error(_("{show} 分块恢复失败：{error}").format(show=show, error=e))
+            return False
+        except (RequestException, OSError) as e:
+            self.log.warning(
+                _("{show} 分块恢复中断：{error}").format(show=show, error=e)
+            )
+            return False
+        finally:
+            if task_id is not None:
+                progress.remove_task(task_id)
 
     def __record_request_messages(
         self,
