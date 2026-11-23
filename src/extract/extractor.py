@@ -512,6 +512,20 @@ class Extractor:
             )[-1]
         return self.safe_extract(item, f"url_list[{IMAGE_INDEX}]")
 
+    @staticmethod
+    def __select_video_url(urls: list[str]) -> str:
+        direct_urls = []
+        for url in urls:
+            parsed = urlparse(url)
+            if (
+                parsed.hostname in {"www.douyin.com", "douyin.com"}
+                and parsed.path.rstrip("/") == "/aweme/v1/play"
+            ):
+                continue
+            direct_urls.append(url)
+        candidates = direct_urls or urls
+        return candidates[VIDEO_INDEX] if candidates else ""
+
     async def __extract_video_download(
         self,
         data: SimpleNamespace,
@@ -550,7 +564,7 @@ class Extractor:
                 (
                     bit_rate[-1][-3],
                     bit_rate[-1][-2],
-                    bit_rate[-1][-1][VIDEO_INDEX],
+                    self.__select_video_url(bit_rate[-1][-1]),
                 )
                 if bit_rate
                 else (-1, -1, "")
@@ -572,9 +586,8 @@ class Extractor:
                 "play_addr.width",
                 -1,
             )
-            url = self.safe_extract(
-                bit_rate[0],
-                f"play_addr.url_list[{VIDEO_INDEX}]",
+            url = self.__select_video_url(
+                self.safe_extract(bit_rate[0], "play_addr.url_list", []),
             )
         if use_original_quality and self.download and self.original_quality:
             uri = self.safe_extract(data, "video.play_addr.uri")
